@@ -1,13 +1,8 @@
 {
-    "name": "MeshyAssembly",
+    "name": "MeshyRuntime",
     "rootNamespace": "",
-    "references": [
-        "Unity.Formats.Fbx.Editor",
-        "MeshyRuntime"
-    ],
-    "includePlatforms": [
-        "Editor"
-    ],
+    "references": [],
+    "includePlatforms": [],
     "excludePlatforms": [],
     "allowUnsafeCode": false,
     "overrideReferences": false,
