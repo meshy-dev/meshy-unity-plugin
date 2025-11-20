@@ -29,6 +29,7 @@ public class MeshyBridgeWindow : EditorWindow
 	GUIContent runButtonContent;
 	GUIContent stopButtonContent;
 
+	static bool _standOnGround = true;
 	[Serializable]
 	public class MeshTransfer
 	{
@@ -42,8 +43,8 @@ public class MeshyBridgeWindow : EditorWindow
 	public static void ShowWindow()
 	{
 		MeshyBridgeWindow window = GetWindow<MeshyBridgeWindow>("Meshy Bridge");
-		window.minSize = new(250, 100);
-		window.maxSize = new(400, 150);
+		window.minSize = new(250, 120);
+		window.maxSize = new(400, 170);
 	}
 
 	void OnEnable()
@@ -71,7 +72,9 @@ public class MeshyBridgeWindow : EditorWindow
 		if (IsRunning) GUI.backgroundColor = new Color(0.4f, 0.6f, 1.0f);
 		GUIContent currentContent = IsRunning ? stopButtonContent : runButtonContent;
 		if (GUILayout.Button(currentContent, buttonStyle)) ToggleBridgeState();
-		GUI.backgroundColor = originalColor;
+		GUI.backgroundColor = originalColor; 
+		GUILayout.Space(5);
+		_standOnGround = EditorGUILayout.Toggle(new GUIContent("Stand on Ground", "If enabled, imported models will be placed on the Y=0 plane."), _standOnGround);
 		EditorGUILayout.EndVertical();
 		Repaint();
 	}
@@ -729,6 +732,19 @@ public class MeshyBridgeWindow : EditorWindow
 
 				sceneObject.transform.position = Vector3.zero;
 
+				if (_standOnGround)
+				{
+					Bounds bounds = new();
+					foreach (var r in sceneObject.GetComponentsInChildren<Renderer>())
+					{
+						bounds.Encapsulate(r.bounds);
+					}
+
+					if (bounds.size != Vector3.zero)
+					{
+						sceneObject.transform.position = new Vector3(0, -bounds.min.y, 0);
+					}
+				}
 				GameObject fixedObject = CreateFixedClone(sceneObject);
 
 				string tempExportPath = Path.Combine(Path.GetTempPath(), $"{fixedObject.name}_{Guid.NewGuid()}.fbx");

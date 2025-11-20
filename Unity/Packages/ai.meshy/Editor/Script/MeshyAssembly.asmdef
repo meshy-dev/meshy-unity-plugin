@@ -2,8 +2,7 @@
     "name": "MeshyAssembly",
     "rootNamespace": "",
     "references": [
-        "Unity.Formats.Fbx.Editor",
-        "MeshyRuntime"
+        "Unity.Formats.Fbx.Editor"
     ],
     "includePlatforms": [
         "Editor"
