@@ -12,6 +12,15 @@ using UnityEditor.SceneManagement;
 using System.Linq;
 using UnityEditor.Animations;
 using UnityEditor.Formats.Fbx.Exporter;
+using UnityEngine.Rendering;
+
+public enum RenderPipeline
+{
+	Unsupported,
+	BuiltIn,
+	URP,
+	HDRP
+}
 
 public class MeshyBridgeWindow : EditorWindow
 {
@@ -581,10 +590,40 @@ public class MeshyBridgeWindow : EditorWindow
 	static void AddDefaultMaterial(GameObject obj)
 	{
 		Renderer renderer = obj.GetComponent<Renderer>();
-		if (renderer != null && renderer.sharedMaterials.Length == 0)
+		if (renderer == null || renderer.sharedMaterials.Any(m => m != null)) return;
+	
+		RenderPipeline pipeline = GetActiveRenderPipeline();
+		Shader shader;
+		switch (pipeline)
 		{
-			Material material = new(Shader.Find("Standard")) { name = "Meshy_Material" };
+			case RenderPipeline.URP:
+				shader = Shader.Find("Universal Render Pipeline/Lit");
+				break;
+			case RenderPipeline.HDRP:
+				shader = Shader.Find("HDRP/Lit");
+				break;
+			default:
+				shader = Shader.Find("Standard");
+				break;
+		}
+	
+		if (shader == null)
+		{
+			Debug.LogWarning("[Meshy Bridge] Could not find a default shader for the current render pipeline. Falling back to Standard.");
+			shader = Shader.Find("Standard");
+		}
+	
+		Material material = new(shader) { name = "Meshy_Material" };
+	
+		if (renderer.sharedMaterials.Length == 0)
 			renderer.sharedMaterial = material;
+		else
+		{
+			Material[] materials = renderer.sharedMaterials;
+			for (int i = 0; i < materials.Length; i++)
+				if (materials[i] == null)
+					materials[i] = material;
+			renderer.sharedMaterials = materials;
 		}
 	}
 
@@ -717,21 +756,14 @@ public class MeshyBridgeWindow : EditorWindow
 			AssetDatabase.ImportAsset(fbxRelativePath, ImportAssetOptions.ForceUpdate);
 
 			GameObject importedObject = AssetDatabase.LoadAssetAtPath<GameObject>(fbxRelativePath);
-			if (importedObject == null) return;
-
+			if (!importedObject) return;
 			importedObject.name = modelName;
-
-			FixMaterialTextureReferences(importedObject, modelDir);
-
-			EditorUtility.SetDirty(importedObject);
-			AssetDatabase.SaveAssets();
-
+			
 			EditorApplication.delayCall += () =>
 			{
 				if (PrefabUtility.InstantiatePrefab(importedObject) is not GameObject sceneObject) return;
 
 				sceneObject.transform.position = Vector3.zero;
-
 				if (_standOnGround)
 				{
 					Bounds bounds = new();
@@ -745,6 +777,8 @@ public class MeshyBridgeWindow : EditorWindow
 						sceneObject.transform.position = new Vector3(0, -bounds.min.y, 0);
 					}
 				}
+				FixMaterialTextureReferences(sceneObject, modelDir);
+
 				GameObject fixedObject = CreateFixedClone(sceneObject);
 
 				string tempExportPath = Path.Combine(Path.GetTempPath(), $"{fixedObject.name}_{Guid.NewGuid()}.fbx");
@@ -759,7 +793,7 @@ public class MeshyBridgeWindow : EditorWindow
 				AssetDatabase.ImportAsset(fbxRelativePath, ImportAssetOptions.ForceUpdate);
 
 				GameObject finalImportedObject = AssetDatabase.LoadAssetAtPath<GameObject>(fbxRelativePath);
-				if (finalImportedObject == null)
+				if (!finalImportedObject)
 				{
 					Debug.LogError($"[Meshy Bridge] Failed to reload the fixed FBX asset at {fbxRelativePath}");
 					return;
@@ -820,58 +854,100 @@ public class MeshyBridgeWindow : EditorWindow
 	static void FixMaterialTextureReferences(GameObject fbxObject, string modelDir)
 	{
 		Renderer[] renderers = fbxObject.GetComponentsInChildren<Renderer>();
-
-		foreach (Renderer renderer in renderers)
+foreach (Renderer renderer in renderers)
 		{
-			Material[] materials = renderer.sharedMaterials;
-
-			for (int i = 0; i < materials.Length; i++)
+			Material[] sharedMaterials = renderer.sharedMaterials;
+			Material[] newMaterials = new Material[sharedMaterials.Length];
+			for (int i = 0; i < sharedMaterials.Length; i++)
 			{
-				Material material = materials[i];
-				if (material == null) continue;
-
-				if (material.mainTexture == null)
+				Material originalMaterial = sharedMaterials[i];
+				if (originalMaterial == null) 
 				{
-					string textureName = material.name;
-					Texture2D foundTexture = FindTextureInDirectory(modelDir, textureName);
+					newMaterials[i] = null;
+					continue;
+				}
+				Material material = new(originalMaterial);
+				RenderPipeline pipeline = GetActiveRenderPipeline();
+				Debug.Log($"[Meshy Bridge] Detected Render Pipeline: {pipeline}");
+				Shader newShader;
 
-					if (foundTexture != null)
+				switch (pipeline)
+				{
+					case RenderPipeline.URP:
+						newShader = Shader.Find("Universal Render Pipeline/Lit");
+						break;
+					case RenderPipeline.HDRP:
+						newShader = Shader.Find("HDRP/Lit");
+						break;
+					default:
+						newShader = Shader.Find("Standard");
+						break;
+				}
+				if (newShader != null) material.shader = newShader;
+
+				string shaderName = material.shader.name;
+				bool isURP = shaderName.Contains("Universal Render Pipeline");
+				bool isHDRP = shaderName.Contains("HDRP");
+				string albedoPropertyName = isURP ? "_BaseMap" : isHDRP ? "_BaseColorMap" : "_MainTex";
+				if (material.HasProperty(albedoPropertyName) && material.GetTexture(albedoPropertyName) == null)
+				{
+					Texture2D albedoTexture = FindTextureInDirectory(modelDir, originalMaterial.name) ?? FindTextureInDirectory(modelDir, "albedo") ?? FindTextureInDirectory(modelDir, "diffuse") ?? FindTextureInDirectory(modelDir, "basecolor") ?? FindTextureInDirectory(modelDir, "base_color") ?? FindFirstTextureInDirectory(modelDir);
+					if (albedoTexture != null)
 					{
-						material.mainTexture = foundTexture;
-						Debug.Log($"[Meshy Bridge] Set texture for material {material.name}: {foundTexture.name}");
-					}
-					else
-					{
-						Texture2D firstTexture = FindFirstTextureInDirectory(modelDir);
-						if (firstTexture != null)
-						{
-							material.mainTexture = firstTexture;
-							Debug.Log($"[Meshy Bridge] Set default texture for material {material.name}: {firstTexture.name}");
-						}
+						material.SetTexture(albedoPropertyName, albedoTexture);
+						Debug.Log($"[Meshy Bridge] Set {albedoPropertyName} for material {material.name}: {albedoTexture.name}");
 					}
 				}
+				if (isURP)
+				{
+					if (CheckAndAssignTexture(material, "_BumpMap", modelDir, "normal", "Normal"))
+						material.SetFloat("_BumpScale", 0.5f);
+					CheckAndAssignTexture(material, "_MetallicGlossMap", modelDir, "metallic", "Metallic");
+					CheckAndAssignTexture(material, "_OcclusionMap", modelDir, "occlusion", "AO", "ambient_occlusion");
+					CheckAndAssignTexture(material, "_EmissionMap", modelDir, "emission", "Emissive");
 
-				CheckAndAssignTexture(material, "_BumpMap", modelDir, "normal", "Normal");
-				CheckAndAssignTexture(material, "_MetallicGlossMap", modelDir, "metallic", "Metallic");
-				CheckAndAssignTexture(material, "_OcclusionMap", modelDir, "occlusion", "AO");
-				CheckAndAssignTexture(material, "_EmissionMap", modelDir, "emission", "Emissive");
+					if (material.GetTexture("_MetallicGlossMap") == null && material.HasProperty("_Smoothness"))
+						material.SetFloat("_Smoothness", 0.5f);
+				}
+				else if (isHDRP)
+				{
+					CheckAndAssignTexture(material, "_NormalMap", modelDir, "normal", "Normal");
+					CheckAndAssignTexture(material, "_EmissiveColorMap", modelDir, "emission", "Emissive");
+				}
+				else
+				{
+					CheckAndAssignTexture(material, "_BumpMap", modelDir, "normal", "Normal");
+					CheckAndAssignTexture(material, "_MetallicGlossMap", modelDir, "metallic", "Metallic");
+					CheckAndAssignTexture(material, "_OcclusionMap", modelDir, "occlusion", "AO", "ambient_occlusion");
+					CheckAndAssignTexture(material, "_EmissionMap", modelDir, "emission", "Emissive");
+					if (material.GetTexture("_MetallicGlossMap") == null && material.HasProperty("_Glossiness"))
+						material.SetFloat("_Glossiness", 0.5f);
+				}
+
+				string materialPath = Path.Combine(modelDir, $"{material.name.Replace("(Instance)", "").Trim()}.mat");
+				AssetDatabase.CreateAsset(material, materialPath);
+				newMaterials[i] = AssetDatabase.LoadAssetAtPath<Material>(materialPath);
+				Debug.Log($"[Meshy Bridge] Created and saved material asset at: {materialPath}");
 			}
+			renderer.sharedMaterials = newMaterials;
 		}
 	}
 
-	static void CheckAndAssignTexture(Material material, string propertyName, string modelDir, params string[] nameKeywords)
+	static bool CheckAndAssignTexture(Material material, string propertyName, string modelDir, params string[] nameKeywords)
 	{
-		if (!material.HasProperty(propertyName) || material.GetTexture(propertyName) != null) return;
+		if (!material.HasProperty(propertyName) || material.GetTexture(propertyName) != null) return false;
 
 		foreach (string keyword in nameKeywords)
 		{
 			Texture2D texture = FindTextureInDirectory(modelDir, keyword);
-			if (texture == null) continue;
+			if (texture == null)
+				continue;
 
 			material.SetTexture(propertyName, texture);
 			Debug.Log($"[Meshy Bridge] Set {propertyName} texture for material {material.name}: {texture.name}");
-			break;
+			return true;
 		}
+		return false;
 	}
 
 	static Texture2D FindTextureInDirectory(string directory, string nameKeyword)
@@ -948,5 +1024,21 @@ public class MeshyBridgeWindow : EditorWindow
 			animator.runtimeAnimatorController = controller;
 
 		Debug.Log($"[Meshy Bridge] Created AnimatorController with {clips.Length} animation clips");
+	}
+	
+	public static RenderPipeline GetActiveRenderPipeline()
+	{
+		if (GraphicsSettings.currentRenderPipeline == null)
+			return RenderPipeline.BuiltIn;
+
+		string pipelineAssetName = GraphicsSettings.currentRenderPipeline.GetType().Name;
+
+		if (pipelineAssetName.Contains("UniversalRenderPipelineAsset"))
+			return RenderPipeline.URP;
+            
+		if (pipelineAssetName.Contains("HDRenderPipelineAsset"))
+			return RenderPipeline.HDRP;
+
+		return RenderPipeline.Unsupported;
 	}
 }
