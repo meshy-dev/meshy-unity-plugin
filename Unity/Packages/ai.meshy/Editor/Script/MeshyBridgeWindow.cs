@@ -11,22 +11,23 @@ using System.IO.Compression;
 using UnityEditor.SceneManagement;
 using System.Linq;
 using UnityEditor.Animations;
+using UnityEditor.Formats.Fbx.Exporter;
 
 public class MeshyBridgeWindow : EditorWindow
 {
-	private static string _tempCachePath;
+	static string _tempCachePath;
 
-	private static Thread serverThread;
-	private static Thread guardThread;
-	private static bool _serverStop;
-	private static TcpListener listener;
+	static Thread serverThread;
+	static Thread guardThread;
+	static bool _serverStop;
+	static TcpListener listener;
 
-	private static readonly Queue<MeshTransfer> importQueue = new();
+	static readonly Queue<MeshTransfer> importQueue = new();
 
-	public static bool IsRunning { get; private set; }
+	public static bool IsRunning { get; set; }
 
-	private GUIContent runButtonContent;
-	private GUIContent stopButtonContent;
+	GUIContent runButtonContent;
+	GUIContent stopButtonContent;
 
 	[Serializable]
 	public class MeshTransfer
@@ -45,7 +46,7 @@ public class MeshyBridgeWindow : EditorWindow
 		window.maxSize = new(400, 150);
 	}
 
-	private void OnEnable()
+	void OnEnable()
 	{
 		runButtonContent = new("Run Bridge");
 		stopButtonContent = new("Bridge ON");
@@ -55,13 +56,13 @@ public class MeshyBridgeWindow : EditorWindow
 		StartServer();
 	}
 
-	private void OnDisable()
+	void OnDisable()
 	{
 		EditorApplication.update -= Update;
 		StopServer(true);
 	}
 
-	private void OnGUI()
+	void OnGUI()
 	{
 		EditorGUILayout.BeginVertical();
 		GUILayout.Space(10);
@@ -75,7 +76,7 @@ public class MeshyBridgeWindow : EditorWindow
 		Repaint();
 	}
 
-	private void ToggleBridgeState()
+	void ToggleBridgeState()
 	{
 		if (IsRunning) StopServer();
 		else StartServer();
@@ -98,7 +99,7 @@ public class MeshyBridgeWindow : EditorWindow
 		}
 	}
 
-	private static void GuardJob()
+	static void GuardJob()
 	{
 		while (!_serverStop)
 			Thread.Sleep(200);
@@ -107,7 +108,7 @@ public class MeshyBridgeWindow : EditorWindow
 		Debug.Log("[Meshy Bridge] Guard thread shutting down server");
 	}
 
-	private static void RunServer()
+	static void RunServer()
 	{
 		try
 		{
@@ -161,14 +162,14 @@ public class MeshyBridgeWindow : EditorWindow
 		guardThread?.Join();
 	}
 
-	private static readonly string[] allowedOrigins =
+	static readonly string[] allowedOrigins =
 	{
 		"https://www.meshy.ai",
 		"http://localhost:3700"
 	};
 
 
-	private static void ProcessClientRequest(NetworkStream stream)
+	static void ProcessClientRequest(NetworkStream stream)
 	{
 		try
 		{
@@ -234,14 +235,14 @@ public class MeshyBridgeWindow : EditorWindow
 	}
 
 	[Serializable]
-	private class ImportResponseData
+	class ImportResponseData
 	{
 		public string status;
 		public string message;
 		public string path;
 	}
 
-	private static void ProcessImportRequest(NetworkStream stream, string request, string origin)
+	static void ProcessImportRequest(NetworkStream stream, string request, string origin)
 	{
 		try
 		{
@@ -350,7 +351,7 @@ public class MeshyBridgeWindow : EditorWindow
 	}
 
 	[Serializable]
-	private class ImportRequestData
+	class ImportRequestData
 	{
 		public string url;
 		public string format;
@@ -358,10 +359,10 @@ public class MeshyBridgeWindow : EditorWindow
 		public int frameRate = 30;
 	}
 
-	private static string GetAllowedOrigin(string origin) =>
+	static string GetAllowedOrigin(string origin) =>
 		Array.Exists(allowedOrigins, o => string.Equals(o, origin, StringComparison.OrdinalIgnoreCase)) ? origin : "https://www.meshy.ai";
 
-	private static void SendOptionsResponse(NetworkStream stream, string origin)
+	static void SendOptionsResponse(NetworkStream stream, string origin)
 	{
 		string response = $"HTTP/1.1 200 OK\r\n" +
 		                  $"Access-Control-Allow-Origin: {GetAllowedOrigin(origin)}\r\n" +
@@ -372,14 +373,14 @@ public class MeshyBridgeWindow : EditorWindow
 	}
 
 	[Serializable]
-	private class StatusResponseData
+	class StatusResponseData
 	{
 		public string status = "ok";
 		public string dcc = "unity";
 		public string version;
 	}
 
-	private static void SendStatusResponse(NetworkStream stream, string origin)
+	static void SendStatusResponse(NetworkStream stream, string origin)
 	{
 		StatusResponseData responseData = new()
 		{
@@ -407,7 +408,7 @@ public class MeshyBridgeWindow : EditorWindow
 		Debug.Log($"[Meshy Bridge] Status response sent: {jsonResponse}");
 	}
 
-	private static void SendNotFoundResponse(NetworkStream stream, string origin)
+	static void SendNotFoundResponse(NetworkStream stream, string origin)
 	{
 		string response = $"HTTP/1.1 404 Not Found\r\n" +
 		                  $"Access-Control-Allow-Origin: {GetAllowedOrigin(origin)}\r\n" +
@@ -416,7 +417,7 @@ public class MeshyBridgeWindow : EditorWindow
 		stream.Write(Encoding.UTF8.GetBytes(response), 0, response.Length);
 	}
 
-	private static void SendErrorResponse(NetworkStream stream, string message)
+	static void SendErrorResponse(NetworkStream stream, string message)
 	{
 		try
 		{
@@ -441,7 +442,7 @@ public class MeshyBridgeWindow : EditorWindow
 		}
 	}
 
-	private static string GetHeaderValue(string[] headers, string headerName)
+	static string GetHeaderValue(string[] headers, string headerName)
 	{
 		foreach (string header in headers)
 			if (header.StartsWith(headerName + ":"))
@@ -449,7 +450,7 @@ public class MeshyBridgeWindow : EditorWindow
 		return "";
 	}
 
-	private static void Update()
+	static void Update()
 	{
 		lock (importQueue)
 		{
@@ -461,7 +462,7 @@ public class MeshyBridgeWindow : EditorWindow
 		}
 	}
 
-	private static void ProcessMeshTransfer(MeshTransfer transfer)
+	static void ProcessMeshTransfer(MeshTransfer transfer)
 	{
 		try
 		{
@@ -489,7 +490,7 @@ public class MeshyBridgeWindow : EditorWindow
 		}
 	}
 
-	private static void ImportModelWithMaterial(MeshTransfer transfer)
+	static void ImportModelWithMaterial(MeshTransfer transfer)
 	{
 		try
 		{
@@ -574,7 +575,7 @@ public class MeshyBridgeWindow : EditorWindow
 		}
 	}
 
-	private static void AddDefaultMaterial(GameObject obj)
+	static void AddDefaultMaterial(GameObject obj)
 	{
 		Renderer renderer = obj.GetComponent<Renderer>();
 		if (renderer != null && renderer.sharedMaterials.Length == 0)
@@ -584,7 +585,7 @@ public class MeshyBridgeWindow : EditorWindow
 		}
 	}
 
-	private static void ProcessZipFile(MeshTransfer transfer)
+	static void ProcessZipFile(MeshTransfer transfer)
 	{
 		string extractPath = Path.Combine(_tempCachePath, "extracted");
 		ZipFile.ExtractToDirectory(transfer.path, extractPath);
@@ -614,7 +615,69 @@ public class MeshyBridgeWindow : EditorWindow
 		Directory.Delete(extractPath, true);
 	}
 
-	private static void ImportFBXWithTextures(MeshTransfer transfer)
+	static GameObject CreateFixedClone(GameObject source)
+	{
+		GameObject fixedRoot = new(source.name + "_Fixed");
+		Dictionary<Transform, Transform> sourceToFixedMap = new() { { source.transform, fixedRoot.transform } };
+
+		foreach (Transform sourceTransform in source.GetComponentsInChildren<Transform>(true))
+		{
+			if (sourceTransform == source.transform) continue;
+			if (!sourceToFixedMap.TryGetValue(sourceTransform.parent, out Transform fixedParent)) continue;
+			Transform fixedTransform = new GameObject(sourceTransform.name).transform;
+			fixedTransform.SetParent(fixedParent);
+			sourceToFixedMap[sourceTransform] = fixedTransform;
+		}
+
+		foreach (MeshFilter sourceMf in source.GetComponentsInChildren<MeshFilter>(true))
+		{
+			if (!sourceToFixedMap.TryGetValue(sourceMf.transform, out Transform fixedGoTransform)) continue;
+			GameObject fixedGo = fixedGoTransform.gameObject;
+
+			if (sourceMf.GetComponent<MeshRenderer>() is not { } sourceMr) continue;
+			if (sourceMf.sharedMesh is not { } sourceMesh) continue;
+
+			Matrix4x4 bakeMatrix = sourceMf.transform.localToWorldMatrix;
+			Mesh fixedMesh = new() { name = sourceMesh.name };
+
+			Vector3[] vertices = sourceMesh.vertices;
+			Vector3[] normals = sourceMesh.normals;
+			Vector4[] tangents = sourceMesh.tangents;
+
+			for (int i = 0; i < vertices.Length; i++)
+				vertices[i] = bakeMatrix.MultiplyPoint3x4(vertices[i]);
+
+			if (normals != null && normals.Length == vertices.Length)
+				for (int i = 0; i < normals.Length; i++)
+					normals[i] = bakeMatrix.MultiplyVector(normals[i]).normalized;
+
+			if (tangents != null && tangents.Length == vertices.Length)
+			{
+				for (int i = 0; i < tangents.Length; i++)
+				{
+					Vector3 tan = new(tangents[i].x, tangents[i].y, tangents[i].z);
+					tan = bakeMatrix.MultiplyVector(tan).normalized;
+					tangents[i] = new Vector4(tan.x, tan.y, tan.z, tangents[i].w);
+				}
+			}
+
+			fixedMesh.vertices = vertices;
+			fixedMesh.normals = normals;
+			fixedMesh.tangents = tangents;
+			fixedMesh.uv = sourceMesh.uv;
+			fixedMesh.triangles = sourceMesh.triangles;
+			fixedMesh.uv2 = sourceMesh.uv2;
+			fixedMesh.colors = sourceMesh.colors;
+			fixedMesh.RecalculateBounds();
+
+			fixedGo.AddComponent<MeshFilter>().sharedMesh = fixedMesh;
+			fixedGo.AddComponent<MeshRenderer>().sharedMaterials = sourceMr.sharedMaterials;
+		}
+
+		return fixedRoot;
+	}
+
+	static void ImportFBXWithTextures(MeshTransfer transfer)
 	{
 		try
 		{
@@ -665,10 +728,34 @@ public class MeshyBridgeWindow : EditorWindow
 				if (PrefabUtility.InstantiatePrefab(importedObject) is not GameObject sceneObject) return;
 
 				sceneObject.transform.position = Vector3.zero;
-				Selection.activeGameObject = sceneObject;
-				EditorSceneManager.MarkSceneDirty(sceneObject.scene);
 
-				Debug.Log($"[Meshy Bridge] FBX model successfully added to scene: {sceneObject.name}");
+				GameObject fixedObject = CreateFixedClone(sceneObject);
+
+				string tempExportPath = Path.Combine(Path.GetTempPath(), $"{fixedObject.name}_{Guid.NewGuid()}.fbx");
+				ModelExporter.ExportObject(tempExportPath, fixedObject);
+
+				DestroyImmediate(sceneObject);
+				DestroyImmediate(fixedObject);
+
+				File.Delete(fbxRelativePath);
+				File.Move(tempExportPath, fbxRelativePath);
+
+				AssetDatabase.ImportAsset(fbxRelativePath, ImportAssetOptions.ForceUpdate);
+
+				GameObject finalImportedObject = AssetDatabase.LoadAssetAtPath<GameObject>(fbxRelativePath);
+				if (finalImportedObject == null)
+				{
+					Debug.LogError($"[Meshy Bridge] Failed to reload the fixed FBX asset at {fbxRelativePath}");
+					return;
+				}
+
+				if (PrefabUtility.InstantiatePrefab(finalImportedObject) is not GameObject finalSceneObject) return;
+
+				finalSceneObject.transform.position = Vector3.zero;
+				Selection.activeGameObject = finalSceneObject;
+				EditorSceneManager.MarkSceneDirty(finalSceneObject.scene);
+
+				Debug.Log($"[Meshy Bridge] FBX model successfully fixed and added to scene: {finalSceneObject.name}");
 			};
 
 			Debug.Log($"[Meshy Bridge] FBX model imported successfully: {fbxRelativePath}");
@@ -679,49 +766,42 @@ public class MeshyBridgeWindow : EditorWindow
 		}
 	}
 
-	private static void ImportTextureFiles(string sourceDir, string targetDir)
+	static void ImportTextureFiles(string sourceDir, string targetDir)
 	{
 		string[] textureExtensions = { "*.jpg", "*.jpeg", "*.png", "*.tga", "*.bmp", "*.tiff", "*.tif", "*.exr", "*.hdr" };
+		const string normalMapKeyword = "texture_normal";
 
-		foreach (string pattern in textureExtensions)
+		var allTextureFiles = textureExtensions.SelectMany(ext => Directory.GetFiles(sourceDir, ext, SearchOption.AllDirectories));
+
+		foreach (string sourcePath in allTextureFiles)
 		{
-			string[] textureFiles = Directory.GetFiles(sourceDir, pattern, SearchOption.TopDirectoryOnly);
-			foreach (string textureFile in textureFiles)
+			string relativePath = Path.GetRelativePath(sourceDir, sourcePath);
+			string targetPath = Path.Combine(targetDir, relativePath);
+
+			Directory.CreateDirectory(Path.GetDirectoryName(targetPath));
+			File.Copy(sourcePath, targetPath, true);
+
+			AssetDatabase.ImportAsset(targetPath, ImportAssetOptions.ForceUpdate);
+			if (AssetImporter.GetAtPath(targetPath) is not TextureImporter textureImporter) continue;
+
+			string lowerFileName = Path.GetFileName(targetPath).ToLower();
+			if (lowerFileName.Contains(normalMapKeyword))
 			{
-				string fileName = Path.GetFileName(textureFile);
-				string targetPath = Path.Combine(targetDir, fileName);
-
-				File.Copy(textureFile, targetPath, true);
-				Debug.Log($"[Meshy Bridge] Copied texture file: {fileName}");
-			}
-		}
-
-		string[] subDirectories = Directory.GetDirectories(sourceDir);
-		foreach (string subDir in subDirectories)
-		{
-			string subDirName = Path.GetFileName(subDir);
-			string targetSubDir = Path.Combine(targetDir, subDirName);
-
-			Directory.CreateDirectory(targetSubDir);
-
-			foreach (string pattern in textureExtensions)
-			{
-				string[] textureFiles = Directory.GetFiles(subDir, pattern, SearchOption.AllDirectories);
-				foreach (string textureFile in textureFiles)
+				if (textureImporter.textureType != TextureImporterType.NormalMap)
 				{
-					string relativePath = Path.GetRelativePath(subDir, textureFile);
-					string targetPath = Path.Combine(targetSubDir, relativePath);
-
-					Directory.CreateDirectory(Path.GetDirectoryName(targetPath));
-
-					File.Copy(textureFile, targetPath, true);
-					Debug.Log($"[Meshy Bridge] Copied subdirectory texture file: {subDirName}/{relativePath}");
+					textureImporter.textureType = TextureImporterType.NormalMap;
+					textureImporter.SaveAndReimport();
+					Debug.Log($"[Meshy Bridge] Set texture type to Normal Map for: {Path.GetFileName(targetPath)}");
 				}
+			}
+			else
+			{
+				Debug.Log($"[Meshy Bridge] Copied texture file: {Path.GetFileName(targetPath)}");
 			}
 		}
 	}
 
-	private static void FixMaterialTextureReferences(GameObject fbxObject, string modelDir)
+	static void FixMaterialTextureReferences(GameObject fbxObject, string modelDir)
 	{
 		Renderer[] renderers = fbxObject.GetComponentsInChildren<Renderer>();
 
@@ -763,7 +843,7 @@ public class MeshyBridgeWindow : EditorWindow
 		}
 	}
 
-	private static void CheckAndAssignTexture(Material material, string propertyName, string modelDir, params string[] nameKeywords)
+	static void CheckAndAssignTexture(Material material, string propertyName, string modelDir, params string[] nameKeywords)
 	{
 		if (!material.HasProperty(propertyName) || material.GetTexture(propertyName) != null) return;
 
@@ -778,7 +858,7 @@ public class MeshyBridgeWindow : EditorWindow
 		}
 	}
 
-	private static Texture2D FindTextureInDirectory(string directory, string nameKeyword)
+	static Texture2D FindTextureInDirectory(string directory, string nameKeyword)
 	{
 		string[] textureExtensions = { "*.jpg", "*.jpeg", "*.png", "*.tga", "*.bmp", "*.tiff", "*.tif" };
 
@@ -799,7 +879,7 @@ public class MeshyBridgeWindow : EditorWindow
 		return null;
 	}
 
-	private static Texture2D FindFirstTextureInDirectory(string directory)
+	static Texture2D FindFirstTextureInDirectory(string directory)
 	{
 		string[] textureExtensions = { "*.jpg", "*.jpeg", "*.png", "*.tga", "*.bmp", "*.tiff", "*.tif" };
 
@@ -816,7 +896,7 @@ public class MeshyBridgeWindow : EditorWindow
 		return null;
 	}
 
-	private static void CleanupTempFile(string path)
+	static void CleanupTempFile(string path)
 	{
 		try
 		{
@@ -829,7 +909,7 @@ public class MeshyBridgeWindow : EditorWindow
 		}
 	}
 	
-	private static void CreateAnimatorControllerForMultipleClips(GameObject sceneObject, string modelPath)
+	static void CreateAnimatorControllerForMultipleClips(GameObject sceneObject, string modelPath)
 	{
 		AnimationClip[] clips = AssetDatabase.LoadAllAssetsAtPath(modelPath).OfType<AnimationClip>().ToArray();
 		if (clips.Length <= 1) return;
