@@ -196,7 +196,7 @@ public class MeshyBridge : MonoBehaviour
             if (!jsonBody.Trim().StartsWith("{") || !jsonBody.Trim().EndsWith("}"))
                 throw new Exception("Invalid JSON format");
             
-            Debug.Log($"[Meshy Bridge] JSON: {jsonBody}");
+            
 
             ImportRequestData data = JsonUtility.FromJson<ImportRequestData>(jsonBody);
 
@@ -604,9 +604,6 @@ public class MeshyBridge : MonoBehaviour
                 if (PrefabUtility.InstantiatePrefab(importedObject) is not GameObject sceneObject) return;
                 
                 sceneObject.transform.position = Vector3.zero;
-                sceneObject.transform.rotation = Quaternion.identity;
-                sceneObject.transform.localScale = Vector3.one;
-
                 Selection.activeGameObject = sceneObject;
                 EditorSceneManager.MarkSceneDirty(sceneObject.scene);
 
