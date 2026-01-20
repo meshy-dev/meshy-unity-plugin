@@ -21,3 +21,4 @@ Unity/Packages/packages-lock.json
 # Build scripts (temporary)
 export-package.sh
 
+Unity/Assets/Scenes/test scene.unity
