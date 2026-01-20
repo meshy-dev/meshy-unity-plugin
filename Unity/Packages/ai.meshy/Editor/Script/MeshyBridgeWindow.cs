@@ -11,7 +11,6 @@ using System.IO.Compression;
 using UnityEditor.SceneManagement;
 using System.Linq;
 using UnityEditor.Animations;
-using UnityEditor.Formats.Fbx.Exporter;
 using UnityEngine.Rendering;
 
 public enum RenderPipeline
@@ -567,10 +566,35 @@ public class MeshyBridgeWindow : EditorWindow
 				if (PrefabUtility.InstantiatePrefab(importedObject) is not GameObject sceneObject) return;
 
 				sceneObject.transform.position = Vector3.zero;
-				sceneObject.transform.rotation = Quaternion.identity;
 				sceneObject.transform.localScale = Vector3.one;
 
-				Animator animator = sceneObject.GetComponent<Animator>() ?? sceneObject.AddComponent<Animator>();
+				if (_standOnGround)
+				{
+					// Keep the prefab's original rotation and adjust Y position
+					Renderer[] renderers = sceneObject.GetComponentsInChildren<Renderer>();
+					if (renderers.Length > 0)
+					{
+						Bounds bounds = renderers[0].bounds;
+						for (int i = 1; i < renderers.Length; i++)
+						{
+							bounds.Encapsulate(renderers[i].bounds);
+						}
+
+						if (bounds.size != Vector3.zero)
+						{
+							sceneObject.transform.position = new Vector3(0, -bounds.min.y, 0);
+						}
+					}
+				}
+				else
+				{
+					// Reset rotation to identity (original model orientation)
+					sceneObject.transform.rotation = Quaternion.identity;
+				}
+
+				// Ensure Animator component exists for animation clips
+				if (sceneObject.GetComponent<Animator>() == null)
+					sceneObject.AddComponent<Animator>();
 
 				CreateAnimatorControllerForMultipleClips(sceneObject, relativePath);
 
@@ -630,6 +654,11 @@ public class MeshyBridgeWindow : EditorWindow
 	static void ProcessZipFile(MeshTransfer transfer)
 	{
 		string extractPath = Path.Combine(_tempCachePath, "extracted");
+		
+		// Clean up existing extraction directory if it exists
+		if (Directory.Exists(extractPath))
+			Directory.Delete(extractPath, true);
+			
 		ZipFile.ExtractToDirectory(transfer.path, extractPath);
 
 		foreach (string file in Directory.GetFiles(extractPath, "*.glb", SearchOption.AllDirectories))
@@ -655,68 +684,6 @@ public class MeshyBridgeWindow : EditorWindow
 		}
 
 		Directory.Delete(extractPath, true);
-	}
-
-	static GameObject CreateFixedClone(GameObject source)
-	{
-		GameObject fixedRoot = new(source.name + "_Fixed");
-		Dictionary<Transform, Transform> sourceToFixedMap = new() { { source.transform, fixedRoot.transform } };
-
-		foreach (Transform sourceTransform in source.GetComponentsInChildren<Transform>(true))
-		{
-			if (sourceTransform == source.transform) continue;
-			if (!sourceToFixedMap.TryGetValue(sourceTransform.parent, out Transform fixedParent)) continue;
-			Transform fixedTransform = new GameObject(sourceTransform.name).transform;
-			fixedTransform.SetParent(fixedParent);
-			sourceToFixedMap[sourceTransform] = fixedTransform;
-		}
-
-		foreach (MeshFilter sourceMf in source.GetComponentsInChildren<MeshFilter>(true))
-		{
-			if (!sourceToFixedMap.TryGetValue(sourceMf.transform, out Transform fixedGoTransform)) continue;
-			GameObject fixedGo = fixedGoTransform.gameObject;
-
-			if (sourceMf.GetComponent<MeshRenderer>() is not { } sourceMr) continue;
-			if (sourceMf.sharedMesh is not { } sourceMesh) continue;
-
-			Matrix4x4 bakeMatrix = sourceMf.transform.localToWorldMatrix;
-			Mesh fixedMesh = new() { name = sourceMesh.name };
-
-			Vector3[] vertices = sourceMesh.vertices;
-			Vector3[] normals = sourceMesh.normals;
-			Vector4[] tangents = sourceMesh.tangents;
-
-			for (int i = 0; i < vertices.Length; i++)
-				vertices[i] = bakeMatrix.MultiplyPoint3x4(vertices[i]);
-
-			if (normals != null && normals.Length == vertices.Length)
-				for (int i = 0; i < normals.Length; i++)
-					normals[i] = bakeMatrix.MultiplyVector(normals[i]).normalized;
-
-			if (tangents != null && tangents.Length == vertices.Length)
-			{
-				for (int i = 0; i < tangents.Length; i++)
-				{
-					Vector3 tan = new(tangents[i].x, tangents[i].y, tangents[i].z);
-					tan = bakeMatrix.MultiplyVector(tan).normalized;
-					tangents[i] = new Vector4(tan.x, tan.y, tan.z, tangents[i].w);
-				}
-			}
-
-			fixedMesh.vertices = vertices;
-			fixedMesh.normals = normals;
-			fixedMesh.tangents = tangents;
-			fixedMesh.uv = sourceMesh.uv;
-			fixedMesh.triangles = sourceMesh.triangles;
-			fixedMesh.uv2 = sourceMesh.uv2;
-			fixedMesh.colors = sourceMesh.colors;
-			fixedMesh.RecalculateBounds();
-
-			fixedGo.AddComponent<MeshFilter>().sharedMesh = fixedMesh;
-			fixedGo.AddComponent<MeshRenderer>().sharedMaterials = sourceMr.sharedMaterials;
-		}
-
-		return fixedRoot;
 	}
 
 	static void ImportFBXWithTextures(MeshTransfer transfer)
@@ -755,57 +722,62 @@ public class MeshyBridgeWindow : EditorWindow
 
 			AssetDatabase.ImportAsset(fbxRelativePath, ImportAssetOptions.ForceUpdate);
 
+			// Try to extract embedded textures
+			if (AssetImporter.GetAtPath(fbxRelativePath) is ModelImporter importer)
+			{
+				if (importer.ExtractTextures(modelDir))
+				{
+					Debug.Log($"[Meshy Bridge] Extracted embedded textures to: {modelDir}");
+					AssetDatabase.Refresh();
+					AssetDatabase.ImportAsset(fbxRelativePath, ImportAssetOptions.ForceUpdate);
+				}
+			}
+
 			GameObject importedObject = AssetDatabase.LoadAssetAtPath<GameObject>(fbxRelativePath);
 			if (!importedObject) return;
 			importedObject.name = modelName;
-			
+
+			FixMaterialTextureReferences(importedObject, modelDir);
+
+			EditorUtility.SetDirty(importedObject);
+			AssetDatabase.SaveAssets();
+
 			EditorApplication.delayCall += () =>
 			{
 				if (PrefabUtility.InstantiatePrefab(importedObject) is not GameObject sceneObject) return;
 
 				sceneObject.transform.position = Vector3.zero;
+				sceneObject.transform.localScale = Vector3.one;
+
 				if (_standOnGround)
 				{
-					Bounds bounds = new();
-					foreach (var r in sceneObject.GetComponentsInChildren<Renderer>())
+					// Keep the prefab's original rotation (FBX coordinate system correction)
+					// and adjust Y position so the model stands on the ground (Y=0)
+					Renderer[] renderers = sceneObject.GetComponentsInChildren<Renderer>();
+					if (renderers.Length > 0)
 					{
-						bounds.Encapsulate(r.bounds);
-					}
+						Bounds bounds = renderers[0].bounds;
+						for (int i = 1; i < renderers.Length; i++)
+						{
+							bounds.Encapsulate(renderers[i].bounds);
+						}
 
-					if (bounds.size != Vector3.zero)
-					{
-						sceneObject.transform.position = new Vector3(0, -bounds.min.y, 0);
+						if (bounds.size != Vector3.zero)
+						{
+							sceneObject.transform.position = new Vector3(0, -bounds.min.y, 0);
+						}
 					}
 				}
-				FixMaterialTextureReferences(sceneObject, modelDir);
-
-				GameObject fixedObject = CreateFixedClone(sceneObject);
-
-				string tempExportPath = Path.Combine(Path.GetTempPath(), $"{fixedObject.name}_{Guid.NewGuid()}.fbx");
-				ModelExporter.ExportObject(tempExportPath, fixedObject);
-
-				DestroyImmediate(sceneObject);
-				DestroyImmediate(fixedObject);
-
-				File.Delete(fbxRelativePath);
-				File.Move(tempExportPath, fbxRelativePath);
-
-				AssetDatabase.ImportAsset(fbxRelativePath, ImportAssetOptions.ForceUpdate);
-
-				GameObject finalImportedObject = AssetDatabase.LoadAssetAtPath<GameObject>(fbxRelativePath);
-				if (!finalImportedObject)
+				else
 				{
-					Debug.LogError($"[Meshy Bridge] Failed to reload the fixed FBX asset at {fbxRelativePath}");
-					return;
+					// Reset rotation to identity (original model orientation)
+					sceneObject.transform.rotation = Quaternion.identity;
 				}
 
-				if (PrefabUtility.InstantiatePrefab(finalImportedObject) is not GameObject finalSceneObject) return;
+				Selection.activeGameObject = sceneObject;
+				EditorSceneManager.MarkSceneDirty(sceneObject.scene);
 
-				finalSceneObject.transform.position = Vector3.zero;
-				Selection.activeGameObject = finalSceneObject;
-				EditorSceneManager.MarkSceneDirty(finalSceneObject.scene);
-
-				Debug.Log($"[Meshy Bridge] FBX model successfully fixed and added to scene: {finalSceneObject.name}");
+				Debug.Log($"[Meshy Bridge] FBX model successfully added to scene: {sceneObject.name}");
 			};
 
 			Debug.Log($"[Meshy Bridge] FBX model imported successfully: {fbxRelativePath}");
@@ -853,8 +825,10 @@ public class MeshyBridgeWindow : EditorWindow
 
 	static void FixMaterialTextureReferences(GameObject fbxObject, string modelDir)
 	{
+		RenderPipeline pipeline = GetActiveRenderPipeline();
 		Renderer[] renderers = fbxObject.GetComponentsInChildren<Renderer>();
-foreach (Renderer renderer in renderers)
+		
+		foreach (Renderer renderer in renderers)
 		{
 			Material[] sharedMaterials = renderer.sharedMaterials;
 			Material[] newMaterials = new Material[sharedMaterials.Length];
@@ -867,8 +841,6 @@ foreach (Renderer renderer in renderers)
 					continue;
 				}
 				Material material = new(originalMaterial);
-				RenderPipeline pipeline = GetActiveRenderPipeline();
-				Debug.Log($"[Meshy Bridge] Detected Render Pipeline: {pipeline}");
 				Shader newShader;
 
 				switch (pipeline)
@@ -902,6 +874,9 @@ foreach (Renderer renderer in renderers)
 				{
 					if (CheckAndAssignTexture(material, "_BumpMap", modelDir, "normal", "Normal"))
 						material.SetFloat("_BumpScale", 0.5f);
+					// Also fix existing normal map texture type if already assigned
+					EnsureNormalMapTextureType(material, "_BumpMap");
+					
 					CheckAndAssignTexture(material, "_MetallicGlossMap", modelDir, "metallic", "Metallic");
 					CheckAndAssignTexture(material, "_OcclusionMap", modelDir, "occlusion", "AO", "ambient_occlusion");
 					CheckAndAssignTexture(material, "_EmissionMap", modelDir, "emission", "Emissive");
@@ -912,11 +887,17 @@ foreach (Renderer renderer in renderers)
 				else if (isHDRP)
 				{
 					CheckAndAssignTexture(material, "_NormalMap", modelDir, "normal", "Normal");
+					// Also fix existing normal map texture type if already assigned
+					EnsureNormalMapTextureType(material, "_NormalMap");
+					
 					CheckAndAssignTexture(material, "_EmissiveColorMap", modelDir, "emission", "Emissive");
 				}
 				else
 				{
 					CheckAndAssignTexture(material, "_BumpMap", modelDir, "normal", "Normal");
+					// Also fix existing normal map texture type if already assigned
+					EnsureNormalMapTextureType(material, "_BumpMap");
+					
 					CheckAndAssignTexture(material, "_MetallicGlossMap", modelDir, "metallic", "Metallic");
 					CheckAndAssignTexture(material, "_OcclusionMap", modelDir, "occlusion", "AO", "ambient_occlusion");
 					CheckAndAssignTexture(material, "_EmissionMap", modelDir, "emission", "Emissive");
@@ -943,11 +924,54 @@ foreach (Renderer renderer in renderers)
 			if (texture == null)
 				continue;
 
+			// If assigning to a normal map property, ensure the texture is imported as NormalMap
+			bool isNormalMapProperty = propertyName == "_BumpMap" || propertyName == "_NormalMap";
+			if (isNormalMapProperty)
+			{
+				string texturePath = AssetDatabase.GetAssetPath(texture);
+				if (AssetImporter.GetAtPath(texturePath) is TextureImporter textureImporter)
+				{
+					if (textureImporter.textureType != TextureImporterType.NormalMap)
+					{
+						textureImporter.textureType = TextureImporterType.NormalMap;
+						textureImporter.SaveAndReimport();
+						Debug.Log($"[Meshy Bridge] Set texture type to Normal Map for: {texture.name}");
+						// Reload texture after reimport
+						texture = AssetDatabase.LoadAssetAtPath<Texture2D>(texturePath);
+					}
+				}
+			}
+
 			material.SetTexture(propertyName, texture);
 			Debug.Log($"[Meshy Bridge] Set {propertyName} texture for material {material.name}: {texture.name}");
 			return true;
 		}
 		return false;
+	}
+
+	/// <summary>
+	/// Ensures that a texture assigned to a normal map property has the correct import type.
+	/// This fixes issues where embedded textures are auto-assigned but not marked as normal maps.
+	/// </summary>
+	static void EnsureNormalMapTextureType(Material material, string propertyName)
+	{
+		if (!material.HasProperty(propertyName)) return;
+		
+		Texture texture = material.GetTexture(propertyName);
+		if (texture == null) return;
+
+		string texturePath = AssetDatabase.GetAssetPath(texture);
+		if (string.IsNullOrEmpty(texturePath)) return;
+
+		if (AssetImporter.GetAtPath(texturePath) is TextureImporter textureImporter)
+		{
+			if (textureImporter.textureType != TextureImporterType.NormalMap)
+			{
+				textureImporter.textureType = TextureImporterType.NormalMap;
+				textureImporter.SaveAndReimport();
+				Debug.Log($"[Meshy Bridge] Fixed texture type to Normal Map for: {texture.name}");
+			}
+		}
 	}
 
 	static Texture2D FindTextureInDirectory(string directory, string nameKeyword)
