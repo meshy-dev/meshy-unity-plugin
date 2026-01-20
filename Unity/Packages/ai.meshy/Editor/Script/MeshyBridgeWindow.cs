@@ -722,17 +722,6 @@ public class MeshyBridgeWindow : EditorWindow
 
 			AssetDatabase.ImportAsset(fbxRelativePath, ImportAssetOptions.ForceUpdate);
 
-			// Try to extract embedded textures
-			if (AssetImporter.GetAtPath(fbxRelativePath) is ModelImporter importer)
-			{
-				if (importer.ExtractTextures(modelDir))
-				{
-					Debug.Log($"[Meshy Bridge] Extracted embedded textures to: {modelDir}");
-					AssetDatabase.Refresh();
-					AssetDatabase.ImportAsset(fbxRelativePath, ImportAssetOptions.ForceUpdate);
-				}
-			}
-
 			GameObject importedObject = AssetDatabase.LoadAssetAtPath<GameObject>(fbxRelativePath);
 			if (!importedObject) return;
 			importedObject.name = modelName;
