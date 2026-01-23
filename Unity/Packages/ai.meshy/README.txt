@@ -1,7 +1,7 @@
 Meshy Unity Plugin - Bridge Edition
 ====================================
 
-Version: 0.2.0
+Version: 0.2.2
 License: GPL-3.0
 
 DESCRIPTION
@@ -15,6 +15,8 @@ FEATURES
 - Support for GLB, FBX, and ZIP formats
 - Automatic material and texture setup
 - Animation clip detection and controller generation
+- Multi-render pipeline support (Built-In, URP, HDRP)
+- Stand on Ground feature for automatic placement
 - One-click operation
 
 GETTING STARTED

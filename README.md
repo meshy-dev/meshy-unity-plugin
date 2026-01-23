@@ -8,6 +8,8 @@ A streamlined Unity plugin that enables direct model import from [Meshy.ai](http
 - **📦 Multi-Format Support**: GLB, FBX, and ZIP archives
 - **🎨 Automatic Material Setup**: Materials and textures imported automatically
 - **🎬 Animation Support**: Built-in animation clip and AnimatorController generation
+- **🎯 Multi-Pipeline Support**: Works with Built-In, URP, and HDRP render pipelines
+- **🦶 Stand on Ground**: Automatic model placement on the ground plane
 - **🚀 One-Click Operation**: Simple menu integration in Unity Editor
 
 ## Requirements
@@ -110,7 +112,15 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## Changelog
 
-### Version 0.2.0 (Current)
+### Version 0.2.2 (Current)
+- Refactored Bridge code into single `MeshyBridgeWindow.cs` for better maintainability
+- Added multi-render pipeline support (Built-In, URP, HDRP)
+- Added "Stand on Ground" feature for automatic model placement
+- Improved material texture assignment for all render pipelines
+- Fixed NormalMap texture type warnings
+- Added HDRP material texture property mapping (_MaskMap support)
+
+### Version 0.2.0
 - Removed API browser functionality
 - Streamlined to Bridge-only mode
 - Improved stability and performance
