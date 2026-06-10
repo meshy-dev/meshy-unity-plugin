@@ -370,8 +370,18 @@ public class MeshyBridgeWindow : EditorWindow
 		public int frameRate = 30;
 	}
 
+	static bool IsAllowedOrigin(string origin)
+	{
+		if (string.IsNullOrEmpty(origin)) return false;
+		if (Array.Exists(allowedOrigins, o => string.Equals(o, origin, StringComparison.OrdinalIgnoreCase))) return true;
+		// Staging, including preview deployments: https://[*.]app-staging.meshy.ai
+		return origin.StartsWith("https://", StringComparison.OrdinalIgnoreCase)
+			&& (string.Equals(origin, "https://app-staging.meshy.ai", StringComparison.OrdinalIgnoreCase)
+				|| origin.EndsWith(".app-staging.meshy.ai", StringComparison.OrdinalIgnoreCase));
+	}
+
 	static string GetAllowedOrigin(string origin) =>
-		Array.Exists(allowedOrigins, o => string.Equals(o, origin, StringComparison.OrdinalIgnoreCase)) ? origin : "https://www.meshy.ai";
+		IsAllowedOrigin(origin) ? origin : "https://www.meshy.ai";
 
 	static void SendOptionsResponse(NetworkStream stream, string origin)
 	{
@@ -726,7 +736,21 @@ public class MeshyBridgeWindow : EditorWindow
 			if (!importedObject) return;
 			importedObject.name = modelName;
 
-			FixMaterialTextureReferences(importedObject, modelDir);
+			// The export pipeline ships role-named maps next to the FBX. When we
+			// find them, rebuild a channel-correct PBR material (FBX itself can't
+			// carry metallic/roughness); otherwise fall back to name heuristics.
+			MeshyTextureSet meshyTextures = FindMeshyTextures(modelDir);
+			if (meshyTextures.HasAny())
+				BuildMeshyMaterials(importedObject, modelDir, meshyTextures);
+			else
+			{
+				// No per-channel PNG maps shipped with this FBX. We fall back to
+				// whatever the FBX carries (embedded/lossy), which won't be a
+				// channel-correct PBR/emission setup. Surface it so the lossy path
+				// is visible rather than silently producing a degraded material.
+				Debug.LogWarning($"[Meshy Bridge] No per-channel PNG maps found next to {fbxFileName}; falling back to FBX-embedded textures (may be lossy, no metallic/roughness/emission split).");
+				FixMaterialTextureReferences(importedObject, modelDir);
+			}
 
 			EditorUtility.SetDirty(importedObject);
 			AssetDatabase.SaveAssets();
@@ -901,6 +925,416 @@ public class MeshyBridgeWindow : EditorWindow
 			}
 			renderer.sharedMaterials = newMaterials;
 		}
+	}
+
+	// =====================================================================
+	// Channel-correct PBR rebuild from the FBX zip's named textures.
+	// The export pipeline ships the FBX alongside loose, role-named maps:
+	// <stem>.png (base color) and <stem>_normal/_metallic/_roughness/_emission/
+	// _ao.png. FBX can't carry metallic/roughness, so we identify the loose
+	// maps by suffix and assign them to the correct material channels.
+	// Building a FRESH material is also the white-material fix: copying the
+	// FBX-imported material kept stale shader keywords (e.g. _NORMALMAP enabled
+	// with a null _BumpMap).
+	// =====================================================================
+
+	const string MeshyBaseColorName = "meshy_basecolor";
+	const string MeshyNormalName = "meshy_normal";
+	const string MeshyEmissionName = "meshy_emission";
+	const string MeshyOcclusionName = "meshy_occlusion";
+	const string MeshyMetallicGlossName = "meshy_metallic_smoothness";
+	const string MeshyMaskName = "meshy_mask";
+
+	static readonly string[] MeshyTextureExtensions =
+		{ ".png", ".jpg", ".jpeg", ".tga", ".bmp", ".tif", ".tiff", ".exr" };
+
+	/// <summary>Local source paths of the model's per-channel textures (found in the import dir).</summary>
+	class MeshyTextureSet
+	{
+		public string color;
+		public string normal;
+		public string metallic;
+		public string roughness;
+		public string emission;
+		public string ao;
+
+		public bool HasAny() =>
+			!string.IsNullOrEmpty(color) || !string.IsNullOrEmpty(normal)
+			|| !string.IsNullOrEmpty(metallic) || !string.IsNullOrEmpty(roughness)
+			|| !string.IsNullOrEmpty(emission) || !string.IsNullOrEmpty(ao);
+	}
+
+	static bool HasChannelSuffix(string nameLower) =>
+		nameLower.EndsWith("_normal") || nameLower.EndsWith("_normalmap")
+		|| nameLower.EndsWith("_metallic") || nameLower.EndsWith("_metalness")
+		|| nameLower.EndsWith("_roughness")
+		|| nameLower.EndsWith("_emission") || nameLower.EndsWith("_emissive")
+		|| nameLower.EndsWith("_ao") || nameLower.EndsWith("_occlusion") || nameLower.EndsWith("_ambient_occlusion")
+		|| nameLower.EndsWith("_metallic_roughness") || nameLower.EndsWith("_orm")
+		|| nameLower.EndsWith("_height") || nameLower.EndsWith("_displacement");
+
+	// Identify the model's per-channel textures by filename suffix. The export
+	// pipeline names them <stem>[_channel].<ext>; the base color is the map
+	// with no recognized channel suffix.
+	static MeshyTextureSet FindMeshyTextures(string modelDir)
+	{
+		var set = new MeshyTextureSet();
+		string[] files = Directory.GetFiles(modelDir, "*.*", SearchOption.AllDirectories)
+			.Where(f => MeshyTextureExtensions.Contains(Path.GetExtension(f).ToLower()))
+			.ToArray();
+
+		foreach (string file in files)
+		{
+			string n = Path.GetFileNameWithoutExtension(file).ToLower();
+			if (n.EndsWith("_normal") || n.EndsWith("_normalmap")) set.normal ??= file;
+			else if (n.EndsWith("_metallic") || n.EndsWith("_metalness")) set.metallic ??= file;
+			else if (n.EndsWith("_roughness")) set.roughness ??= file;
+			else if (n.EndsWith("_emission") || n.EndsWith("_emissive")) set.emission ??= file;
+			else if (n.EndsWith("_ao") || n.EndsWith("_occlusion") || n.EndsWith("_ambient_occlusion")) set.ao ??= file;
+		}
+
+		// Packed metallic_roughness (glTF G=rough, B=metal): fall back to it for
+		// both channels when separate maps are absent.
+		string packed = files.FirstOrDefault(f =>
+		{
+			string n = Path.GetFileNameWithoutExtension(f).ToLower();
+			return n.EndsWith("_metallic_roughness") || n.EndsWith("_orm");
+		});
+		if (packed != null)
+		{
+			set.metallic ??= packed;
+			set.roughness ??= packed;
+		}
+
+		// Base color = the map with no recognized channel suffix.
+		set.color = files.FirstOrDefault(f => !HasChannelSuffix(Path.GetFileNameWithoutExtension(f).ToLower()));
+		return set;
+	}
+
+	static void BuildMeshyMaterials(GameObject fbxObject, string modelDir, MeshyTextureSet files)
+	{
+		RenderPipeline pipeline = GetActiveRenderPipeline();
+
+		// Maps that bind 1:1 to a material slot.
+		Texture2D baseColor = ImportRawAsAsset(files.color, modelDir, MeshyBaseColorName, isNormal: false, sRGB: true);
+		Texture2D normal = ImportRawAsAsset(files.normal, modelDir, MeshyNormalName, isNormal: true, sRGB: false);
+		Texture2D emission = ImportRawAsAsset(files.emission, modelDir, MeshyEmissionName, isNormal: false, sRGB: true);
+		Texture2D occlusion = ImportRawAsAsset(files.ao, modelDir, MeshyOcclusionName, isNormal: false, sRGB: false);
+
+		// metallic + roughness must be packed into the engine-specific layout.
+		Texture2D metallicGloss = null; // URP / Built-in: RGB = metallic, A = smoothness (1 - roughness)
+		Texture2D maskMap = null;       // HDRP: R = metallic, G = AO, B = detail, A = smoothness
+		if (pipeline == RenderPipeline.HDRP)
+			maskMap = ComposeHDRPMaskMap(files.metallic, files.roughness, files.ao, modelDir, MeshyMaskName);
+		else
+			metallicGloss = ComposeMetallicSmoothnessMap(files.metallic, files.roughness, modelDir, MeshyMetallicGlossName);
+
+		Renderer[] renderers = fbxObject.GetComponentsInChildren<Renderer>();
+		foreach (Renderer renderer in renderers)
+		{
+			Material[] shared = renderer.sharedMaterials;
+			Material[] rebuilt = new Material[shared.Length];
+			for (int i = 0; i < shared.Length; i++)
+			{
+				Material original = shared[i];
+				if (original == null) { rebuilt[i] = null; continue; }
+
+				Shader shader = pipeline switch
+				{
+					RenderPipeline.URP => Shader.Find("Universal Render Pipeline/Lit"),
+					RenderPipeline.HDRP => Shader.Find("HDRP/Lit"),
+					_ => Shader.Find("Standard"),
+				};
+				// Fresh material — never copy the FBX-imported one, so no stale keywords survive.
+				Material mat = new(shader) { name = SanitizeMaterialName(original.name) };
+
+				if (pipeline == RenderPipeline.URP)
+					ConfigureUrpMaterial(mat, baseColor, normal, metallicGloss, occlusion, emission);
+				else if (pipeline == RenderPipeline.HDRP)
+					ConfigureHdrpMaterial(mat, baseColor, normal, maskMap, emission);
+				else
+					ConfigureBuiltinMaterial(mat, baseColor, normal, metallicGloss, occlusion, emission);
+
+				string materialPath = Path.Combine(modelDir, $"{mat.name}.mat").Replace('\\', '/');
+				AssetDatabase.CreateAsset(mat, materialPath);
+				rebuilt[i] = AssetDatabase.LoadAssetAtPath<Material>(materialPath);
+				Debug.Log($"[Meshy Bridge] Rebuilt PBR material from bridge textures: {materialPath}");
+			}
+			renderer.sharedMaterials = rebuilt;
+		}
+	}
+
+	static string SanitizeMaterialName(string name)
+	{
+		string n = (name ?? "").Replace("(Instance)", "").Trim();
+		if (string.IsNullOrEmpty(n)) n = "Meshy_Material";
+		return string.Join("_", n.Split(Path.GetInvalidFileNameChars()));
+	}
+
+	static void ConfigureUrpMaterial(Material mat, Texture2D baseColor, Texture2D normal, Texture2D metallicGloss, Texture2D occlusion, Texture2D emission)
+	{
+		if (mat.HasProperty("_BaseColor")) mat.SetColor("_BaseColor", Color.white);
+		if (baseColor != null && mat.HasProperty("_BaseMap")) mat.SetTexture("_BaseMap", baseColor);
+
+		if (normal != null)
+		{
+			mat.SetTexture("_BumpMap", normal);
+			mat.SetFloat("_BumpScale", 1f);
+			mat.EnableKeyword("_NORMALMAP");
+		}
+		else
+		{
+			mat.SetTexture("_BumpMap", null);
+			mat.DisableKeyword("_NORMALMAP");
+		}
+
+		if (metallicGloss != null)
+		{
+			mat.SetTexture("_MetallicGlossMap", metallicGloss);
+			mat.SetFloat("_Metallic", 1f);
+			mat.SetFloat("_Smoothness", 1f);
+			if (mat.HasProperty("_SmoothnessTextureChannel")) mat.SetFloat("_SmoothnessTextureChannel", 0f); // Metallic Alpha
+			mat.EnableKeyword("_METALLICSPECGLOSSMAP");
+		}
+		else
+		{
+			mat.SetTexture("_MetallicGlossMap", null);
+			mat.DisableKeyword("_METALLICSPECGLOSSMAP");
+		}
+
+		if (occlusion != null)
+		{
+			mat.SetTexture("_OcclusionMap", occlusion);
+			if (mat.HasProperty("_OcclusionStrength")) mat.SetFloat("_OcclusionStrength", 1f);
+			mat.EnableKeyword("_OCCLUSIONMAP");
+		}
+		else
+		{
+			mat.SetTexture("_OcclusionMap", null);
+			mat.DisableKeyword("_OCCLUSIONMAP");
+		}
+
+		ApplyStandardEmission(mat, emission);
+	}
+
+	static void ConfigureBuiltinMaterial(Material mat, Texture2D baseColor, Texture2D normal, Texture2D metallicGloss, Texture2D occlusion, Texture2D emission)
+	{
+		if (mat.HasProperty("_Color")) mat.SetColor("_Color", Color.white);
+		if (baseColor != null && mat.HasProperty("_MainTex")) mat.SetTexture("_MainTex", baseColor);
+
+		if (normal != null)
+		{
+			mat.SetTexture("_BumpMap", normal);
+			mat.SetFloat("_BumpScale", 1f);
+			mat.EnableKeyword("_NORMALMAP");
+		}
+		else
+		{
+			mat.SetTexture("_BumpMap", null);
+			mat.DisableKeyword("_NORMALMAP");
+		}
+
+		if (metallicGloss != null)
+		{
+			mat.SetTexture("_MetallicGlossMap", metallicGloss);
+			mat.SetFloat("_Metallic", 1f);
+			if (mat.HasProperty("_Glossiness")) mat.SetFloat("_Glossiness", 1f);
+			if (mat.HasProperty("_GlossMapScale")) mat.SetFloat("_GlossMapScale", 1f);
+			if (mat.HasProperty("_SmoothnessTextureChannel")) mat.SetFloat("_SmoothnessTextureChannel", 0f);
+			mat.EnableKeyword("_METALLICGLOSSMAP");
+		}
+		else
+		{
+			mat.SetTexture("_MetallicGlossMap", null);
+			mat.DisableKeyword("_METALLICGLOSSMAP");
+		}
+
+		if (occlusion != null)
+		{
+			mat.SetTexture("_OcclusionMap", occlusion);
+			if (mat.HasProperty("_OcclusionStrength")) mat.SetFloat("_OcclusionStrength", 1f);
+		}
+		else
+		{
+			mat.SetTexture("_OcclusionMap", null);
+		}
+
+		ApplyStandardEmission(mat, emission);
+	}
+
+	static void ConfigureHdrpMaterial(Material mat, Texture2D baseColor, Texture2D normal, Texture2D maskMap, Texture2D emission)
+	{
+		if (mat.HasProperty("_BaseColor")) mat.SetColor("_BaseColor", Color.white);
+		if (baseColor != null && mat.HasProperty("_BaseColorMap")) mat.SetTexture("_BaseColorMap", baseColor);
+
+		if (normal != null)
+		{
+			mat.SetTexture("_NormalMap", normal);
+			mat.EnableKeyword("_NORMALMAP");
+		}
+		else
+		{
+			mat.SetTexture("_NormalMap", null);
+			mat.DisableKeyword("_NORMALMAP");
+		}
+
+		if (maskMap != null)
+		{
+			mat.SetTexture("_MaskMap", maskMap);
+			if (mat.HasProperty("_Metallic")) mat.SetFloat("_Metallic", 1f);
+			if (mat.HasProperty("_Smoothness")) mat.SetFloat("_Smoothness", 1f);
+			mat.EnableKeyword("_MASKMAP");
+		}
+		else
+		{
+			mat.SetTexture("_MaskMap", null);
+			mat.DisableKeyword("_MASKMAP");
+		}
+
+		if (emission != null)
+		{
+			if (mat.HasProperty("_EmissiveColorMap")) mat.SetTexture("_EmissiveColorMap", emission);
+			if (mat.HasProperty("_EmissiveColor")) mat.SetColor("_EmissiveColor", Color.white);
+			if (mat.HasProperty("_UseEmissiveIntensity")) mat.SetFloat("_UseEmissiveIntensity", 0f);
+			mat.EnableKeyword("_EMISSIVE_COLOR_MAP");
+			mat.globalIlluminationFlags = MaterialGlobalIlluminationFlags.RealtimeEmissive;
+		}
+		else
+		{
+			if (mat.HasProperty("_EmissiveColorMap")) mat.SetTexture("_EmissiveColorMap", null);
+			mat.DisableKeyword("_EMISSIVE_COLOR_MAP");
+			mat.globalIlluminationFlags = MaterialGlobalIlluminationFlags.EmissiveIsBlack;
+		}
+	}
+
+	static void ApplyStandardEmission(Material mat, Texture2D emission)
+	{
+		if (emission != null)
+		{
+			if (mat.HasProperty("_EmissionMap")) mat.SetTexture("_EmissionMap", emission);
+			if (mat.HasProperty("_EmissionColor")) mat.SetColor("_EmissionColor", Color.white);
+			mat.EnableKeyword("_EMISSION");
+			mat.globalIlluminationFlags = MaterialGlobalIlluminationFlags.RealtimeEmissive;
+		}
+		else
+		{
+			if (mat.HasProperty("_EmissionMap")) mat.SetTexture("_EmissionMap", null);
+			if (mat.HasProperty("_EmissionColor")) mat.SetColor("_EmissionColor", Color.black);
+			mat.DisableKeyword("_EMISSION");
+			mat.globalIlluminationFlags = MaterialGlobalIlluminationFlags.EmissiveIsBlack;
+		}
+	}
+
+	static Texture2D ImportRawAsAsset(string srcFile, string modelDir, string assetBaseName, bool isNormal, bool sRGB)
+	{
+		if (string.IsNullOrEmpty(srcFile) || !File.Exists(srcFile)) return null;
+		string ext = Path.GetExtension(srcFile);
+		if (string.IsNullOrEmpty(ext)) ext = ".png";
+		string assetPath = Path.Combine(modelDir, assetBaseName + ext).Replace('\\', '/');
+		File.Copy(srcFile, assetPath, true);
+		AssetDatabase.ImportAsset(assetPath, ImportAssetOptions.ForceUpdate);
+		if (AssetImporter.GetAtPath(assetPath) is TextureImporter ti)
+		{
+			bool changed = false;
+			TextureImporterType desired = isNormal ? TextureImporterType.NormalMap : TextureImporterType.Default;
+			if (ti.textureType != desired) { ti.textureType = desired; changed = true; }
+			if (!isNormal && ti.sRGBTexture != sRGB) { ti.sRGBTexture = sRGB; changed = true; }
+			if (changed) ti.SaveAndReimport();
+		}
+		return AssetDatabase.LoadAssetAtPath<Texture2D>(assetPath);
+	}
+
+	static Texture2D ComposeMetallicSmoothnessMap(string metallicFile, string roughnessFile, string modelDir, string assetBaseName)
+	{
+		Texture2D metal = LoadReadableTexture(metallicFile);
+		Texture2D rough = LoadReadableTexture(roughnessFile);
+		if (metal == null && rough == null) return null;
+
+		int w = metal != null ? metal.width : rough.width;
+		int h = metal != null ? metal.height : rough.height;
+		Color[] mp = SamplePixels(metal, w, h);
+		Color[] rp = SamplePixels(rough, w, h);
+
+		var outp = new Color[w * h];
+		for (int i = 0; i < outp.Length; i++)
+		{
+			float m = mp != null ? mp[i].r : 0f;        // no metallic map -> dielectric (0)
+			float r = rp != null ? rp[i].r : 0.5f;       // no roughness map -> mid
+			outp[i] = new Color(m, m, m, 1f - r);        // RGB = metallic, A = smoothness
+		}
+		Texture2D result = SavePackedTexture(outp, w, h, modelDir, assetBaseName);
+		if (metal != null) UnityEngine.Object.DestroyImmediate(metal);
+		if (rough != null) UnityEngine.Object.DestroyImmediate(rough);
+		return result;
+	}
+
+	static Texture2D ComposeHDRPMaskMap(string metallicFile, string roughnessFile, string aoFile, string modelDir, string assetBaseName)
+	{
+		Texture2D metal = LoadReadableTexture(metallicFile);
+		Texture2D rough = LoadReadableTexture(roughnessFile);
+		Texture2D ao = LoadReadableTexture(aoFile);
+		if (metal == null && rough == null && ao == null) return null;
+
+		int w = metal?.width ?? rough?.width ?? ao.width;
+		int h = metal?.height ?? rough?.height ?? ao.height;
+		Color[] mp = SamplePixels(metal, w, h);
+		Color[] rp = SamplePixels(rough, w, h);
+		Color[] ap = SamplePixels(ao, w, h);
+
+		var outp = new Color[w * h];
+		for (int i = 0; i < outp.Length; i++)
+		{
+			float m = mp != null ? mp[i].r : 0f;
+			float occ = ap != null ? ap[i].r : 1f;
+			float r = rp != null ? rp[i].r : 0.5f;
+			outp[i] = new Color(m, occ, 0f, 1f - r);     // R = metallic, G = AO, B = detail, A = smoothness
+		}
+		Texture2D result = SavePackedTexture(outp, w, h, modelDir, assetBaseName);
+		if (metal != null) UnityEngine.Object.DestroyImmediate(metal);
+		if (rough != null) UnityEngine.Object.DestroyImmediate(rough);
+		if (ao != null) UnityEngine.Object.DestroyImmediate(ao);
+		return result;
+	}
+
+	static Texture2D SavePackedTexture(Color[] pixels, int w, int h, string modelDir, string assetBaseName)
+	{
+		Texture2D tex = new(w, h, TextureFormat.RGBA32, false, true);
+		tex.SetPixels(pixels);
+		tex.Apply();
+		string assetPath = Path.Combine(modelDir, assetBaseName + ".png").Replace('\\', '/');
+		File.WriteAllBytes(assetPath, tex.EncodeToPNG());
+		UnityEngine.Object.DestroyImmediate(tex);
+		AssetDatabase.ImportAsset(assetPath, ImportAssetOptions.ForceUpdate);
+		if (AssetImporter.GetAtPath(assetPath) is TextureImporter ti && ti.sRGBTexture)
+		{
+			ti.sRGBTexture = false;
+			ti.SaveAndReimport();
+		}
+		return AssetDatabase.LoadAssetAtPath<Texture2D>(assetPath);
+	}
+
+	static Texture2D LoadReadableTexture(string file)
+	{
+		if (string.IsNullOrEmpty(file) || !File.Exists(file)) return null;
+		// linear: true — read stored bytes as raw data (no sRGB conversion) for data maps.
+		Texture2D tex = new(2, 2, TextureFormat.RGBA32, false, true);
+		if (!tex.LoadImage(File.ReadAllBytes(file)))
+		{
+			UnityEngine.Object.DestroyImmediate(tex);
+			return null;
+		}
+		return tex;
+	}
+
+	static Color[] SamplePixels(Texture2D tex, int w, int h)
+	{
+		if (tex == null) return null;
+		if (tex.width == w && tex.height == h) return tex.GetPixels();
+		var outp = new Color[w * h];
+		for (int y = 0; y < h; y++)
+			for (int x = 0; x < w; x++)
+				outp[y * w + x] = tex.GetPixelBilinear((x + 0.5f) / w, (y + 0.5f) / h);
+		return outp;
 	}
 
 	static bool CheckAndAssignTexture(Material material, string propertyName, string modelDir, params string[] nameKeywords)
