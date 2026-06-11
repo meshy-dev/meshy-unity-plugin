@@ -724,10 +724,6 @@ public class MeshyBridgeWindow : EditorWindow
 			}
 
 			File.Copy(transfer.path, fbxRelativePath, true);
-
-			string sourceDir = Path.GetDirectoryName(transfer.path);
-			ImportTextureFiles(sourceDir, modelDir);
-
 			AssetDatabase.Refresh();
 
 			AssetDatabase.ImportAsset(fbxRelativePath, ImportAssetOptions.ForceUpdate);
@@ -736,19 +732,23 @@ public class MeshyBridgeWindow : EditorWindow
 			if (!importedObject) return;
 			importedObject.name = modelName;
 
-			// The export pipeline ships role-named maps next to the FBX. When we
-			// find them, rebuild a channel-correct PBR material (FBX itself can't
-			// carry metallic/roughness); otherwise fall back to name heuristics.
-			MeshyTextureSet meshyTextures = FindMeshyTextures(modelDir);
+			string sourceDir = Path.GetDirectoryName(transfer.path);
+
+			// The export pipeline ships role-named maps next to the FBX. Identify
+			// them straight from the source (zip) dir and let BuildMeshyMaterials
+			// copy ONLY the channels it uses (as meshy_* assets). We deliberately
+			// do NOT pre-copy every loose texture into the project — that left a
+			// duplicate, original-named copy of each map beside the meshy_* one.
+			MeshyTextureSet meshyTextures = FindMeshyTextures(sourceDir);
 			if (meshyTextures.HasAny())
 				BuildMeshyMaterials(importedObject, modelDir, meshyTextures);
 			else
 			{
-				// No per-channel PNG maps shipped with this FBX. We fall back to
-				// whatever the FBX carries (embedded/lossy), which won't be a
-				// channel-correct PBR/emission setup. Surface it so the lossy path
-				// is visible rather than silently producing a degraded material.
+				// No per-channel PNG maps shipped with this FBX. Fall back to the
+				// FBX-embedded textures (may be lossy, no metallic/roughness/emission
+				// split); the heuristic matcher needs them copied into the project.
 				Debug.LogWarning($"[Meshy Bridge] No per-channel PNG maps found next to {fbxFileName}; falling back to FBX-embedded textures (may be lossy, no metallic/roughness/emission split).");
+				ImportTextureFiles(sourceDir, modelDir);
 				FixMaterialTextureReferences(importedObject, modelDir);
 			}
 
