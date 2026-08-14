@@ -176,6 +176,9 @@ public class MeshyBridgeWindow : EditorWindow
 	static readonly string[] allowedOrigins =
 	{
 		"https://www.meshy.ai",
+		"https://meshy.taichi-graphics.com",
+		"https://meshy.cn",
+		"https://www.meshy.cn",
 		"http://localhost:3700"
 	};
 
