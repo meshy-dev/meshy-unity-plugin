@@ -378,10 +378,10 @@ public class MeshyBridgeWindow : EditorWindow
 	{
 		if (string.IsNullOrEmpty(origin)) return false;
 		if (Array.Exists(allowedOrigins, o => string.Equals(o, origin, StringComparison.OrdinalIgnoreCase))) return true;
-		// Staging, including preview deployments: https://[*.]app-staging.meshy.ai
+		// Staging, including preview deployments: https://[*.]app.staging.meshy.ai
 		return origin.StartsWith("https://", StringComparison.OrdinalIgnoreCase)
-			&& (string.Equals(origin, "https://app-staging.meshy.ai", StringComparison.OrdinalIgnoreCase)
-				|| origin.EndsWith(".app-staging.meshy.ai", StringComparison.OrdinalIgnoreCase));
+			&& (string.Equals(origin, "https://app.staging.meshy.ai", StringComparison.OrdinalIgnoreCase)
+				|| origin.EndsWith(".app.staging.meshy.ai", StringComparison.OrdinalIgnoreCase));
 	}
 
 	static string GetAllowedOrigin(string origin) =>
