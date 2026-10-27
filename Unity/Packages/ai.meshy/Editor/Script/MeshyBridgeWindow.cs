@@ -2,8 +2,10 @@ using UnityEngine;
 using UnityEditor;
 using System.Net;
 using System;
+using System.Net.Http;
 using System.Net.Sockets;
 using System.Threading;
+using System.Threading.Tasks;
 using System.Text;
 using System.IO;
 using System.Collections.Generic;
@@ -137,9 +139,9 @@ public class MeshyBridgeWindow : EditorWindow
 			{
 				if (listener.Pending())
 				{
-					using TcpClient client = listener.AcceptTcpClient();
-					using NetworkStream stream = client.GetStream();
-					ProcessClientRequest(stream);
+					// One pool thread per connection, so a slow download never blocks /status
+					TcpClient client = listener.AcceptTcpClient();
+					ThreadPool.QueueUserWorkItem(_ => HandleClient(client));
 				}
 				Thread.Sleep(100);
 			}
@@ -173,47 +175,94 @@ public class MeshyBridgeWindow : EditorWindow
 		guardThread?.Join();
 	}
 
-	static readonly string[] allowedOrigins =
-	{
-		"https://www.meshy.ai",
-		// China site (served at https://www.taichi-graphics.com/meshy)
-		"https://www.taichi-graphics.com",
-		"https://meshy.cn",
-		"https://www.meshy.cn",
-		"http://localhost:3700"
-	};
+	const int DownloadTimeoutSeconds = 90;
+	const int RequestReadTimeoutMs = 10000;
+	const int MaxHeaderBytes = 64 * 1024;
+	const int MaxBodyBytes = 1024 * 1024;
 
+	// Carries the HTTP status and a client-safe message (no URLs, no local paths)
+	class BridgeException : Exception
+	{
+		public readonly int Status;
+		public BridgeException(int status, string message) : base(message) { Status = status; }
+	}
+
+	static void HandleClient(TcpClient client)
+	{
+		using (client)
+		using (NetworkStream stream = client.GetStream())
+			ProcessClientRequest(stream);
+	}
+
+	// Reads the headers, then exactly Content-Length body bytes. Returns false if the peer sent nothing.
+	static bool TryReadRequest(NetworkStream stream, out string[] requestLines, out string body)
+	{
+		requestLines = null;
+		body = "";
+		stream.ReadTimeout = RequestReadTimeoutMs;
+
+		byte[] chunk = new byte[1024 * 16];
+		using MemoryStream received = new();
+		int bodyStart = -1;
+		int contentLength = 0;
+		while (true)
+		{
+			if (bodyStart < 0)
+			{
+				byte[] buf = received.GetBuffer();
+				for (int i = 3; i < received.Length && bodyStart < 0; i++)
+					if (buf[i - 3] == '\r' && buf[i - 2] == '\n' && buf[i - 1] == '\r' && buf[i] == '\n')
+						bodyStart = i + 1;
+
+				if (bodyStart >= 0)
+				{
+					requestLines = Encoding.UTF8.GetString(buf, 0, bodyStart).Split(new[] { "\r\n" }, StringSplitOptions.None);
+					int.TryParse(GetHeaderValue(requestLines, "Content-Length"), out contentLength);
+					if (contentLength < 0 || contentLength > MaxBodyBytes)
+						throw new BridgeException(400, "request body too large");
+				}
+				else if (received.Length > MaxHeaderBytes)
+					throw new BridgeException(400, "request headers too large");
+			}
+
+			if (bodyStart >= 0 && received.Length >= bodyStart + contentLength)
+				break;
+
+			int n;
+			try { n = stream.Read(chunk, 0, chunk.Length); }
+			catch (IOException) { n = -1; }
+			if (n <= 0)
+			{
+				if (received.Length == 0) return false;
+				throw new BridgeException(400, n < 0 ? "request timed out" : "incomplete request");
+			}
+			received.Write(chunk, 0, n);
+		}
+
+		body = Encoding.UTF8.GetString(received.GetBuffer(), bodyStart, contentLength);
+		return true;
+	}
 
 	static void ProcessClientRequest(NetworkStream stream)
 	{
+		string origin = "";
 		try
 		{
 			Debug.Log("[Meshy Bridge] Processing request");
-			byte[] buffer = new byte[1024 * 16];
-			int bytesRead = stream.Read(buffer, 0, buffer.Length);
-			string request = Encoding.UTF8.GetString(buffer, 0, bytesRead);
-			Debug.Log($"[Meshy Bridge] Received request ({bytesRead} bytes):\n{request}");
-
-			string[] requestLines = request.Split(new[] { "\r\n" }, StringSplitOptions.None);
-
-			if (requestLines.Length == 0)
-			{
-				Debug.LogWarning("[Meshy Bridge] Empty request");
-				SendErrorResponse(stream, "Empty request");
+			if (!TryReadRequest(stream, out string[] requestLines, out string body))
 				return;
-			}
+			Debug.Log($"[Meshy Bridge] Received request:\n{string.Join("\r\n", requestLines)}\n{body}");
 
 			string[] requestParts = requestLines[0].Split(' ');
 			if (requestParts.Length < 2)
 			{
 				Debug.LogWarning("[Meshy Bridge] Invalid request format: " + requestLines[0]);
-				SendErrorResponse(stream, "Invalid request format");
-				return;
+				throw new BridgeException(400, "Invalid request format");
 			}
 
 			string method = requestParts[0];
 			string path = requestParts[1];
-			string origin = GetHeaderValue(requestLines, "Origin");
+			origin = GetHeaderValue(requestLines, "Origin");
 
 			if (method == "OPTIONS")
 			{
@@ -229,23 +278,24 @@ public class MeshyBridgeWindow : EditorWindow
 
 			if (method == "POST" && path == "/import")
 			{
-				ProcessImportRequest(stream, request, origin);
+				// A cross-site "simple" POST skips preflight, so refuse foreign origins here; no Origin means a local tool
+				if (!string.IsNullOrEmpty(origin) && !IsAllowedOrigin(origin))
+					throw new BridgeException(403, "origin not allowed");
+				ProcessImportRequest(stream, body, origin);
 				return;
 			}
 
 			SendNotFoundResponse(stream, origin);
 		}
+		catch (BridgeException e)
+		{
+			Debug.LogWarning($"[Meshy Bridge] Request rejected ({e.Status}): {e.Message}");
+			SendErrorResponse(stream, origin, e.Status, e.Message);
+		}
 		catch (Exception e)
 		{
 			Debug.LogError($"[Meshy Bridge] Error processing request: {e.GetType().Name} - {e.Message}\n{e.StackTrace}");
-			try
-			{
-				SendErrorResponse(stream, e.Message);
-			}
-			catch (Exception ex)
-			{
-				Debug.LogError($"[Meshy Bridge] Failed to send error response: {ex.Message}");
-			}
+			SendErrorResponse(stream, origin, 500, "internal error");
 		}
 	}
 
@@ -254,115 +304,122 @@ public class MeshyBridgeWindow : EditorWindow
 	{
 		public string status;
 		public string message;
-		public string path;
 	}
 
-	static void ProcessImportRequest(NetworkStream stream, string request, string origin)
+	static void ProcessImportRequest(NetworkStream stream, string jsonBody, string origin)
 	{
+		jsonBody = jsonBody.Trim();
+		if (!jsonBody.StartsWith("{") || !jsonBody.EndsWith("}"))
+			throw new BridgeException(400, "request body must be a JSON object");
+
+		ImportRequestData data;
+		try { data = JsonUtility.FromJson<ImportRequestData>(jsonBody); }
+		catch (Exception) { throw new BridgeException(400, "invalid JSON"); }
+
+		if (string.IsNullOrEmpty(data?.url))
+			throw new BridgeException(400, "missing url");
+		if (!Uri.TryCreate(data.url, UriKind.Absolute, out Uri uri)
+			|| (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
+			throw new BridgeException(400, "url must be http(s)");
+
+		string fileName = $"bridge_model_{DateTime.Now:yyyyMMdd_HHmmss}_{Guid.NewGuid().ToString("N")[..8]}";
+		string filePath = Path.Combine(Path.GetTempPath(), "Meshy", fileName);
+
+		Directory.CreateDirectory(Path.GetDirectoryName(filePath));
+
+		if (File.Exists(filePath))
+		{
+			File.Delete(filePath);
+			Debug.Log($"[Meshy Bridge] Deleted existing file: {filePath}");
+		}
+
+		Debug.Log($"[Meshy Bridge] Downloading: {data.url}");
+		string fileExtension;
 		try
 		{
-			int jsonStart = request.IndexOf('{');
-			if (jsonStart < 0)
-				throw new Exception("Invalid request format: JSON not found");
+			DownloadFile(uri, filePath);
+			fileExtension = SniffModelExtension(filePath);
+		}
+		catch
+		{
+			CleanupTempFile(filePath);
+			throw;
+		}
 
-			string jsonBody = request.Substring(jsonStart);
-			if (!jsonBody.Trim().StartsWith("{") || !jsonBody.Trim().EndsWith("}"))
-				throw new Exception("Invalid JSON format");
+		string finalPath = filePath + fileExtension;
 
-			ImportRequestData data = JsonUtility.FromJson<ImportRequestData>(jsonBody);
+		if (File.Exists(finalPath))
+		{
+			File.Delete(finalPath);
+			Debug.Log($"[Meshy Bridge] Deleted existing target file: {finalPath}");
+		}
 
-			string fileName = $"bridge_model_{DateTime.Now:yyyyMMdd_HHmmss}_{Guid.NewGuid().ToString("N")[..8]}";
-			string filePath = Path.Combine(Path.GetTempPath(), "Meshy", fileName);
+		File.Move(filePath, finalPath);
+		filePath = finalPath;
+		Debug.Log($"[Meshy Bridge] File saved: {filePath}");
 
-			Directory.CreateDirectory(Path.GetDirectoryName(filePath));
-
-			if (File.Exists(filePath))
-			{
-				File.Delete(filePath);
-				Debug.Log($"[Meshy Bridge] Deleted existing file: {filePath}");
-			}
-
-			Debug.Log($"[Meshy Bridge] Downloading: {data.url}");
-			using (WebClient client = new())
-			{
-				client.DownloadFile(data.url, filePath);
-			}
-
-			string fileExtension = ".glb";
-			byte[] header = new byte[4];
-			using (FileStream fs = new(filePath, FileMode.Open, FileAccess.Read))
-			{
-				fs.Read(header, 0, header.Length);
-
-				if (data.format.ToLower() == "glb")
+		lock (importQueue)
+		{
+			importQueue.Enqueue(
+				new()
 				{
-					if (header[0] == 'P' && header[1] == 'K' && header[2] == 0x03 && header[3] == 0x04)
-						fileExtension = ".zip";
-					else if (header[0] == 'g' && header[1] == 'l' && header[2] == 'T' && header[3] == 'F')
-						fileExtension = ".glb";
-				}
-				else if (data.format.ToLower() == "fbx")
-				{
-					if (header[0] == 'P' && header[1] == 'K' && header[2] == 0x03 && header[3] == 0x04)
-						fileExtension = ".zip";
-					else
-						fileExtension = ".fbx";
-				}
-			}
+					file_format = fileExtension.Substring(1),
+					path = filePath,
+					name = data.name ?? "",
+					frameRate = data.frameRate
+				});
+		}
 
-			string finalPath = filePath + fileExtension;
+		SendJsonResponse(stream, origin, 200, "ok", "File queued for import");
+		Debug.Log("[Meshy Bridge] Response sent");
+	}
 
-			if (File.Exists(finalPath))
-			{
-				File.Delete(finalPath);
-				Debug.Log($"[Meshy Bridge] Deleted existing target file: {finalPath}");
-			}
-
-			File.Move(filePath, finalPath);
-			filePath = finalPath;
-			Debug.Log($"[Meshy Bridge] File saved: {filePath}");
-
-			lock (importQueue)
-			{
-				importQueue.Enqueue(
-					new()
-					{
-						file_format = data.format,
-						path = filePath,
-						name = data.name ?? "",
-						frameRate = data.frameRate
-					});
-			}
-
-			ImportResponseData responseData = new()
-			{
-				status = "ok",
-				message = "File queued for import",
-				path = filePath
-			};
-
-			string jsonResponse = JsonUtility.ToJson(responseData);
-
-			string response = string.Join(
-				"\r\n",
-				"HTTP/1.1 200 OK",
-				$"Access-Control-Allow-Origin: {GetAllowedOrigin(origin)}",
-				"Content-Type: application/json; charset=utf-8",
-				"Connection: close",
-				$"Content-Length: {jsonResponse.Length}",
-				"",
-				jsonResponse);
-
-			byte[] responseBytes = Encoding.UTF8.GetBytes(response);
-			stream.Write(responseBytes, 0, responseBytes.Length);
-			stream.Flush();
-			Debug.Log("[Meshy Bridge] Response sent");
+	static void DownloadFile(Uri uri, string filePath)
+	{
+		HttpResponseMessage response;
+		try
+		{
+			// Buffered read, so Timeout covers the whole transfer
+			using HttpClient client = new() { Timeout = TimeSpan.FromSeconds(DownloadTimeoutSeconds) };
+			response = client.GetAsync(uri).GetAwaiter().GetResult();
+		}
+		catch (TaskCanceledException)
+		{
+			throw new BridgeException(502, "download failed: timeout");
 		}
 		catch (Exception e)
 		{
-			Debug.LogError($"[Meshy Bridge] Error processing import request: {e.Message}");
-			SendErrorResponse(stream, e.Message);
+			Debug.LogWarning($"[Meshy Bridge] Download error: {e.GetType().Name} - {e.Message}");
+			throw new BridgeException(502, "download failed: network error");
 		}
+
+		using (response)
+		{
+			if (!response.IsSuccessStatusCode)
+				throw new BridgeException(502, $"download failed: HTTP {(int)response.StatusCode}");
+
+			using FileStream fs = File.Create(filePath);
+			response.Content.CopyToAsync(fs).GetAwaiter().GetResult();
+		}
+	}
+
+	// Maps the file's magic bytes to the extension ProcessMeshTransfer expects
+	static string SniffModelExtension(string filePath)
+	{
+		byte[] header = new byte[32];
+		int read;
+		using (FileStream fs = new(filePath, FileMode.Open, FileAccess.Read))
+			read = fs.Read(header, 0, header.Length);
+
+		string head = Encoding.ASCII.GetString(header, 0, read);
+		if (read >= 4 && header[0] == 'P' && header[1] == 'K' && header[2] == 0x03 && header[3] == 0x04)
+			return ".zip";
+		if (head.StartsWith("glTF", StringComparison.Ordinal))
+			return ".glb";
+		if (head.StartsWith("Kaydara FBX Binary", StringComparison.Ordinal) || head.StartsWith("; FBX", StringComparison.Ordinal))
+			return ".fbx";
+
+		throw new BridgeException(415, "unsupported file format");
 	}
 
 	[Serializable]
@@ -377,11 +434,18 @@ public class MeshyBridgeWindow : EditorWindow
 	static bool IsAllowedOrigin(string origin)
 	{
 		if (string.IsNullOrEmpty(origin)) return false;
-		if (Array.Exists(allowedOrigins, o => string.Equals(o, origin, StringComparison.OrdinalIgnoreCase))) return true;
-		// Staging, including preview deployments: https://[*.]app.staging.meshy.ai
-		return origin.StartsWith("https://", StringComparison.OrdinalIgnoreCase)
-			&& (string.Equals(origin, "https://app.staging.meshy.ai", StringComparison.OrdinalIgnoreCase)
-				|| origin.EndsWith(".app.staging.meshy.ai", StringComparison.OrdinalIgnoreCase));
+
+		// Exactly https://<host> (no port, path or userinfo), host is meshy.ai / meshy.cn or a subdomain of them
+		if (!Uri.TryCreate(origin, UriKind.Absolute, out Uri uri)
+			|| uri.Scheme != Uri.UriSchemeHttps
+			|| uri.UserInfo.Length > 0
+			|| !uri.IsDefaultPort
+			|| !string.Equals(uri.GetLeftPart(UriPartial.Authority), origin, StringComparison.OrdinalIgnoreCase))
+			return false;
+
+		string host = uri.Host;
+		return host == "meshy.ai" || host.EndsWith(".meshy.ai", StringComparison.Ordinal)
+			|| host == "meshy.cn" || host.EndsWith(".meshy.cn", StringComparison.Ordinal);
 	}
 
 	static string GetAllowedOrigin(string origin) =>
@@ -433,33 +497,14 @@ public class MeshyBridgeWindow : EditorWindow
 		Debug.Log($"[Meshy Bridge] Status response sent: {jsonResponse}");
 	}
 
-	static void SendNotFoundResponse(NetworkStream stream, string origin)
-	{
-		string response = $"HTTP/1.1 404 Not Found\r\n" +
-		                  $"Access-Control-Allow-Origin: {GetAllowedOrigin(origin)}\r\n" +
-		                  "Content-Type: application/json\r\n\r\n" +
-		                  JsonUtility.ToJson(new { status = "path not found" });
-		stream.Write(Encoding.UTF8.GetBytes(response), 0, response.Length);
-	}
+	static void SendNotFoundResponse(NetworkStream stream, string origin) =>
+		SendErrorResponse(stream, origin, 404, "path not found");
 
-	static void SendErrorResponse(NetworkStream stream, string message)
+	static void SendErrorResponse(NetworkStream stream, string origin, int code, string message)
 	{
 		try
 		{
-			string jsonBody = JsonUtility.ToJson(new { status = "error", message });
-			string response = string.Join(
-				"\r\n",
-				"HTTP/1.1 500 Internal Server Error",
-				"Access-Control-Allow-Origin: *",
-				"Content-Type: application/json; charset=utf-8",
-				"Connection: close",
-				$"Content-Length: {jsonBody.Length}",
-				"",
-				jsonBody);
-
-			byte[] responseBytes = Encoding.UTF8.GetBytes(response);
-			stream.Write(responseBytes, 0, responseBytes.Length);
-			stream.Flush();
+			SendJsonResponse(stream, origin, code, "error", message);
 		}
 		catch (Exception e)
 		{
@@ -467,23 +512,55 @@ public class MeshyBridgeWindow : EditorWindow
 		}
 	}
 
+	static void SendJsonResponse(NetworkStream stream, string origin, int code, string status, string message)
+	{
+		string reason = code switch
+		{
+			200 => "OK",
+			400 => "Bad Request",
+			403 => "Forbidden",
+			404 => "Not Found",
+			415 => "Unsupported Media Type",
+			502 => "Bad Gateway",
+			_ => "Internal Server Error"
+		};
+		byte[] body = Encoding.UTF8.GetBytes(JsonUtility.ToJson(new ImportResponseData { status = status, message = message }));
+		string head = string.Join(
+			"\r\n",
+			$"HTTP/1.1 {code} {reason}",
+			$"Access-Control-Allow-Origin: {GetAllowedOrigin(origin)}",
+			"Content-Type: application/json; charset=utf-8",
+			"Connection: close",
+			$"Content-Length: {body.Length}",
+			"",
+			"");
+
+		byte[] headBytes = Encoding.UTF8.GetBytes(head);
+		stream.Write(headBytes, 0, headBytes.Length);
+		stream.Write(body, 0, body.Length);
+		stream.Flush();
+	}
+
 	static string GetHeaderValue(string[] headers, string headerName)
 	{
 		foreach (string header in headers)
-			if (header.StartsWith(headerName + ":"))
+			if (header.StartsWith(headerName + ":", StringComparison.OrdinalIgnoreCase))
 				return header.Substring(headerName.Length + 1).Trim();
 		return "";
 	}
 
 	static void Update()
 	{
-		lock (importQueue)
+		while (true)
 		{
-			while (importQueue.Count > 0)
+			MeshTransfer transfer;
+			// Don't hold the lock while importing, so /import can keep enqueueing
+			lock (importQueue)
 			{
-				MeshTransfer transfer = importQueue.Dequeue();
-				ProcessMeshTransfer(transfer);
+				if (importQueue.Count == 0) return;
+				transfer = importQueue.Dequeue();
 			}
+			ProcessMeshTransfer(transfer);
 		}
 	}
 
